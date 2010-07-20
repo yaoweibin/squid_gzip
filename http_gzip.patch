@@ -313,29 +313,6 @@ index 1b7c36a..b581391 100644
      if (fwd->servers)
  	httpState->peer = fwd->servers->peer;	/* might be NULL */
      if (httpState->peer) {
-diff --git a/src/client_side.c b/src/client_side.c
-index f44b1ae..e5ab4b6 100644
---- a/src/client_side.c
-+++ b/src/client_side.c
-@@ -96,7 +96,6 @@
- #include <linux/netfilter_ipv4.h>
- #endif
- 
--
- #if LINGERING_CLOSE
- #define comm_close comm_lingering_close
- #endif
-@@ -2839,7 +2838,9 @@ clientSendHeaders(void *data, HttpReply * rep)
-      * - [ahc]
-      */
-     http->range_iter.prefix_size = rep->hdr_sz;
--    debug(33, 3) ("clientSendHeaders: %d bytes of headers\n", rep->hdr_sz);
-+    debug(33, 3) ("clientSendHeaders: %d bytes of headers, vary_headers: %s, gzip: %d \n", 
-+            rep->hdr_sz, entry->mem_obj->vary_headers, entry->http_gzip);
-+
-     clientHttpLocationRewriteCheck(http);
- }
- 
 diff --git a/src/enums.h b/src/enums.h
 index 4c94a9a..68376c3 100644
 --- a/src/enums.h
@@ -401,6 +378,24 @@ index 8185e3b..e91483e 100644
  	storeClientCallback(sc, copy_sz);
  	return;
      }
+diff --git a/src/store_swapmeta.c b/src/store_swapmeta.c
+index a3cc1b2..c19de7e 100644
+--- a/src/store_swapmeta.c
++++ b/src/store_swapmeta.c
+@@ -83,6 +83,13 @@ storeSwapMetaBuild(StoreEntry * e)
+     if (objsize > -1) {
+ 	T = storeSwapTLVAdd(STORE_META_OBJSIZE, &objsize, sizeof(objsize), T);
+     }
++
++#if HTTP_GZIP
++    if (e->http_gzip) {
++	T = storeSwapTLVAdd(STORE_META_GZIP, "gzip", sizeof("gzip"), T);
++    }
++#endif
++
+     vary = e->mem_obj->vary_headers;
+     if (vary)
+ 	T = storeSwapTLVAdd(STORE_META_VARY_HEADERS, vary, strlen(vary) + 1, T);
 diff --git a/src/HttpGzip.h b/src/HttpGzip.h
 new file mode 100644
 index 0000000..b28c891
