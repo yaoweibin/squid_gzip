@@ -1,0 +1,76 @@
+This patch add the feature of http compression on the fly for squid-2.7
+
+=INSTALLATION=
+
+cd squid-2.7
+patch -p1 < /path/to/http_gzip.patch
+
+compile squid with the following command:
+
+./bootstrap.sh && ./configure --enable-http-gzip && make
+
+=example=
+
+<code>
+http_gzip on
+http_gzip_types text/html,text/plain
+</code>
+
+=DIRECTIVES=
+    ==http_gzip==
+    syntax: http_gzip on|off
+    default: on
+    context: main
+    description: switch the http compression 
+
+    ==http_gzip_types==
+    syntax: http_gzip_types [mime types]
+    default: text/html
+    context: main
+    description: This directive set the MIME types list which need to be 
+    compressed. The types need be separated by ',' and there should not 
+    be any space between types.
+
+    ==http_gzip_hash==
+    syntax: http_gzip_hash memLevel
+    default: 8
+    context: main
+    description: The memlevel parameter specifies how much memory should be
+    allocated for the internal compression state. memLevel=1 uses minimum memory
+    but is slow and reduces compression ratio; memLevel=9 uses maximum memory
+    for optimal speed. 
+
+    ==http_gzip_comp_level==
+    syntax: http_gzip_comp_level level
+    default: 9
+    context: main
+    description: The compression level, between 1 and 9, where 1 is the 
+    least compression (fastest) and 9 is the most (slowest).
+
+    ==http_gzip_min_length==
+    syntax: http_gzip_min_length length
+    default: 0
+    context: main
+    description: Sets the minimum length of of the response that will be
+    compressed. Responses shorter than this will not be compressed. Length is
+    determined from the "Content-Length" header.
+
+    ==http_gzip_window==
+    syntax: http_gzip_window windowBits
+    default: 15
+    context: main
+    description: The windowBits parameter is the base two logarithm of the
+    window size (the size of the history buffer). It should be in the range
+    8..15 for this version of the library. Larger values of this parameter
+    result in better compression at the expense of memory usage. 
+
+    ==http_gzip_prealloc==
+    syntax: http_gzip_prealloc size
+    default: 256 KB
+    context: main
+    description:  We preallocate a memory for zlib in one buffer (default:
+    256K), this decreases a number of malloc() and free() calls and also
+    probably decreases a number of syscalls (sbrk()/mmap() and so on).
+
+
+Questions/patches may be directed to Weibin Yao, yaoweibin@corp.netease.com

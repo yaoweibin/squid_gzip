@@ -1,0 +1,740 @@
+diff --git a/configure.in b/configure.in
+index 9a648e8..714d4f4 100644
+--- a/configure.in
++++ b/configure.in
+@@ -248,6 +248,21 @@ AC_ARG_ENABLE(gnuregex,
+ 			  built in.],
+ [USE_GNUREGEX=$enableval])
+ 
++HTTP_GZIP=0
++
++AC_ARG_ENABLE(http_gzip,
++[  --enable-http-gzip       enable the http_gzip option ],
++[ 
++    if test "$enableval" = "yes" ; then
++    echo "HTTP GZIP enabled"
++    LIBS="$LIBS -lz"
++    AC_DEFINE(HTTP_GZIP, 1, [Define to enable the HTTP gzip compress])
++    HTTP_GZIP=1
++    fi
++])
++
++AM_CONDITIONAL([ENABLE_HTTP_GZIP], [test "$HTTP_GZIP" = 1])
++
+ dnl This is a developer only option.. developers know how to set defines
+ dnl
+ dnl AC_ARG_ENABLE(xmalloc-debug,
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 3742c44..bc76f24 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -30,6 +30,10 @@ if ENABLE_HTCP
+ HTCPSOURCE = htcp.c
+ endif
+ 
++if ENABLE_HTTP_GZIP
++GZIPSOURCE = HttpGzip.c
++endif
++
+ if MAKE_LEAKFINDER
+ LEAKFINDERSOURCE =  leakfinder.c
+ else
+@@ -180,6 +184,7 @@ squid_SOURCES = \
+ 	helper.c \
+ 	$(HTCPSOURCE) \
+ 	http.c \
++	$(GZIPSOURCE) \
+ 	HttpStatusLine.c \
+ 	HttpHdrCc.c \
+ 	HttpHdrRange.c \
+diff --git a/src/cf.data.pre b/src/cf.data.pre
+index 7eb51ba..2e43350 100644
+--- a/src/cf.data.pre
++++ b/src/cf.data.pre
+@@ -5703,5 +5703,69 @@ DOC_START
+ 	Note: after changing this, Squid service must be restarted.
+ DOC_END
+ 
++NAME: http_gzip
++COMMENT: on|off
++IFDEF: HTTP_GZIP
++TYPE: onoff
++LOC: Config.http_gzip.enable
++DEFAULT: on
++DOC_START
++	switch the http compress option, default is on.
++DOC_END
++
++NAME: http_gzip_types
++COMMENT: MIME_TYPE list
++IFDEF: HTTP_GZIP
++TYPE: string
++LOC: Config.http_gzip.types
++DEFAULT: text/html
++DOC_START
++     set the compress mime type list
++DOC_END
++
++NAME: http_gzip_comp_level
++IFDEF: HTTP_GZIP
++TYPE: int
++LOC: Config.http_gzip.level
++DEFAULT: 9
++DOC_START
++	The compression level, between 1 and 9, where 1 is the least compression 
++	(fastest) and 9 is the most (slowest).
++DOC_END
++
++NAME: http_gzip_min_length
++IFDEF: HTTP_GZIP
++TYPE: int
++LOC: Config.http_gzip.min_length
++DEFAULT: 0
++DOC_START
++	Sets the minimum length of of the response that will be compressed. 
++	Responses shorter than this will not be compressed. Length is 
++	determined from the "Content-Length" header.
++DOC_END
++
++NAME: http_gzip_window
++IFDEF: HTTP_GZIP
++TYPE: int
++LOC: Config.http_gzip.wbits
++DEFAULT: 15
++DOC_START
++DOC_END
++
++NAME: http_gzip_hash
++IFDEF: HTTP_GZIP
++TYPE: int
++LOC: Config.http_gzip.memlevel
++DEFAULT: 8
++DOC_START
++DOC_END
++
++NAME: http_gzip_prealloc
++IFDEF: HTTP_GZIP
++TYPE: b_size_t
++LOC: Config.http_gzip.prealloc_size
++DEFAULT: 256 KB
++DOC_START
++DOC_END
+ 
+ EOF
+diff --git a/src/structs.h b/src/structs.h
+index c187f56..0fcf93f 100644
+--- a/src/structs.h
++++ b/src/structs.h
+@@ -842,6 +842,17 @@ struct _SquidConfig {
+     int max_filedescriptors;
+     char *accept_filter;
+     int incoming_rate;
++#if HTTP_GZIP
++    struct {
++	int enable;
++	char *types;
++	int level;
++	int wbits;
++        int memlevel;
++        int min_length;
++	squid_off_t prealloc_size;
++    } http_gzip;
++#endif
+ };
+ 
+ struct _SquidConfig2 {
+@@ -1151,6 +1162,9 @@ struct _HttpStateData {
+     int body_buf_sz;
+     squid_off_t chunk_size;
+     String chunkhdr;
++#if HTTP_GZIP
++    void *context;
++#endif
+ };
+ 
+ struct _icpUdpData {
+@@ -1794,6 +1808,9 @@ struct _StoreEntry {
+     ping_status_t ping_status:3;
+     store_status_t store_status:3;
+     swap_status_t swap_status:3;
++#if HTTP_GZIP
++    int http_gzip;
++#endif
+ };
+ 
+ struct _SwapDir {
+diff --git a/src/http.c b/src/http.c
+index 1b7c36a..b581391 100644
+--- a/src/http.c
++++ b/src/http.c
+@@ -40,6 +40,10 @@
+ 
+ #include "squid.h"
+ 
++#if HTTP_GZIP
++#include "HttpGzip.h"
++#endif
++
+ static const char *const crlf = "\r\n";
+ 
+ static CWCB httpSendComplete;
+@@ -65,6 +69,11 @@ httpStateFree(int fd, void *data)
+ #endif
+     if (httpState == NULL)
+ 	return;
++
++#if HTTP_GZIP
++    httpGzipContextFinalize(httpState);
++#endif
++
+     if (httpState->body_buf) {
+ 	requestAbortBody(httpState->orig_request);
+ 	if (httpState->body_buf) {
+@@ -539,6 +548,18 @@ httpProcessReplyHeader(HttpStateData * httpState, const char *buf, int size)
+ 	/* non-chunked. Handle as one single big chunk (-1 if terminated by EOF) */
+ 	httpState->chunk_size = httpReplyBodySize(httpState->orig_request->method, reply);
+     }
++
++#if HTTP_GZIP
++    if (Config.http_gzip.enable && httpState->context == NULL) {
++	httpGzipStart(httpState);
++	debug(11, 2) ("httpGzipStart: http_gzip: %d, types: %s, min_length: %d, "
++		"level: %d, window: %d, hash: %d, context: %p, gzip: %d\n", 
++		Config.http_gzip.enable, Config.http_gzip.types, Config.http_gzip.min_length,
++		Config.http_gzip.level, Config.http_gzip.wbits, Config.http_gzip.memlevel,
++		httpState->context, entry->http_gzip);
++    }
++#endif
++
+     if (httpHeaderHas(&reply->header, HDR_VARY)
+ #if X_ACCELERATOR_VARY
+ 	|| httpHeaderHas(&reply->header, HDR_X_ACCELERATOR_VARY)
+@@ -669,12 +690,42 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
+ 	    if (size > httpState->chunk_size)
+ 		size = httpState->chunk_size;
+ 	    httpState->chunk_size -= size;
++#if HTTP_GZIP
++	    if (httpState->context) {
++		if (httpGzipCompress(httpState, buf, len) < 0) {
++		    debug(11, 1) ("httpGzipCompress error.\n");
++		    fwdFail(httpState->fwd, errorCon(ERR_INVALID_RESP, 
++				HTTP_INTERNAL_SERVER_ERROR, httpState->fwd->request));
++		    comm_close(fd);
++		    return;
++		}
++	    }
++	    else {
++		storeAppend(httpState->entry, buf, size);
++	    }
++#else
+ 	    storeAppend(httpState->entry, buf, size);
++#endif
+ 	    buf += size;
+ 	    len -= size;
+ 	} else if (httpState->chunk_size < 0) {
+ 	    /* non-chunked without content-length */
++#if HTTP_GZIP
++	    if (httpState->context) {
++		if (httpGzipCompress(httpState, buf, len) < 0) {
++		    debug(11, 1) ("httpGzipCompress error.\n");
++		}
++		fwdFail(httpState->fwd, errorCon(ERR_INVALID_RESP, 
++			    HTTP_INTERNAL_SERVER_ERROR, httpState->fwd->request));
++		comm_close(fd);
++		return;
++	    }
++	    else {
++		storeAppend(httpState->entry, buf, len);
++	    }
++#else
+ 	    storeAppend(httpState->entry, buf, len);
++#endif
+ 	    len = 0;
+ 	} else if (httpState->flags.chunked) {
+ 	    char *eol = memchr(buf, '\n', len);
+@@ -743,7 +794,13 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
+ 	    return;
+ 	}
+     }
++#if HTTP_GZIP
++    if (httpState->context == NULL) {
++	storeBufferFlush(entry);
++    }
++#else
+     storeBufferFlush(entry);
++#endif
+     if (EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
+ 	/*
+ 	 * the above storeBufferFlush() call could ABORT this entry,
+@@ -789,6 +846,36 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
+ 	comm_close(fd);
+ 	return;
+     }
++
++    /* Flush the gzip buffer to cache */
++#if HTTP_GZIP
++    if (httpState->context) {
++	debug(11, 2) ("Flush the gzip buffer to cache.\n");
++
++	HttpGzipContext *ctx = httpState->context;
++
++	debug(11, 2) ("httpGzipDone:" 
++		"gzip context's checksum:%x, original:%x, compressed:%d\n", 
++		ctx->checksum, ctx->originalSize, ctx->compressedSize);
++
++	if (httpGzipDone(httpState) < 0) {
++	    debug(11, 1) ("httpGzipDone error.\n");
++	    comm_close(fd);
++	}
++
++	debug(11, 2) ("httpGzipDone: gzip context's checksum:%x, "
++		"original:%x, compressed:%d, total_out: %d, avail_out: %d\n", 
++		ctx->checksum, ctx->originalSize, ctx->compressedSize,
++	       	ctx->zstream.total_out, ctx->zstream.avail_out);
++
++	storeAppend(httpState->entry, (char *)ctx->gzipBuffer, ctx->compressedSize);
++
++	httpGzipContextFinalize(httpState);
++
++	storeBufferFlush(entry);
++    }
++#endif
++
+     /*
+      * Verified and done with the reply
+      */
+@@ -1498,6 +1585,9 @@ httpStart(FwdState * fwd)
+     httpState->fwd = fwd;
+     httpState->entry = fwd->entry;
+     httpState->fd = fd;
++#if HTTP_GZIP
++    httpState->context = NULL;
++#endif
+     if (fwd->servers)
+ 	httpState->peer = fwd->servers->peer;	/* might be NULL */
+     if (httpState->peer) {
+diff --git a/src/client_side.c b/src/client_side.c
+index f44b1ae..e5ab4b6 100644
+--- a/src/client_side.c
++++ b/src/client_side.c
+@@ -96,7 +96,6 @@
+ #include <linux/netfilter_ipv4.h>
+ #endif
+ 
+-
+ #if LINGERING_CLOSE
+ #define comm_close comm_lingering_close
+ #endif
+@@ -2839,7 +2838,9 @@ clientSendHeaders(void *data, HttpReply * rep)
+      * - [ahc]
+      */
+     http->range_iter.prefix_size = rep->hdr_sz;
+-    debug(33, 3) ("clientSendHeaders: %d bytes of headers\n", rep->hdr_sz);
++    debug(33, 3) ("clientSendHeaders: %d bytes of headers, vary_headers: %s, gzip: %d \n", 
++            rep->hdr_sz, entry->mem_obj->vary_headers, entry->http_gzip);
++
+     clientHttpLocationRewriteCheck(http);
+ }
+ 
+diff --git a/src/enums.h b/src/enums.h
+index 4c94a9a..68376c3 100644
+--- a/src/enums.h
++++ b/src/enums.h
+@@ -665,6 +665,13 @@ enum {
+     STORE_META_END
+ };
+ 
++#if HTTP_GZIP
++
++/*STORE_META_VALID does not use anywhere. so I use it. It's evil.*/
++#define STORE_META_GZIP STORE_META_VALID
++
++#endif
++
+ enum {
+     STORE_LOG_CREATE,
+     STORE_LOG_SWAPIN,
+diff --git a/src/store_client.c b/src/store_client.c
+index 8185e3b..e91483e 100644
+--- a/src/store_client.c
++++ b/src/store_client.c
+@@ -35,6 +35,10 @@
+ 
+ #include "squid.h"
+ 
++#if HTTP_GZIP
++#include "HttpGzip.h"
++#endif
++
+ /*
+  * NOTE: 'Header' refers to the swapfile metadata header.
+  *       'Body' refers to the swapfile body, which is the full
+@@ -432,6 +436,17 @@ storeClientReadHeader(void *data, const char *buf, ssize_t len)
+ 	case STORE_META_STD:
+ 	case STORE_META_STD_LFS:
+ 	    break;
++#if HTTP_GZIP
++	case STORE_META_GZIP:
++
++	    debug(20, 2) ("Got STORE_META_GZIP: %s\n", t->value);
++
++	    if (strcmp("gzip", t->value) == 0) {
++		e->http_gzip = 1;
++	    }
++
++	    break;
++#endif
+ 	case STORE_META_VARY_HEADERS:
+ 	    if (mem->vary_headers) {
+ 		if (strcmp(mem->vary_headers, t->value) != 0)
+@@ -509,6 +524,13 @@ storeClientReadHeader(void *data, const char *buf, ssize_t len)
+ 	if (sc->copy_offset == 0 && len > 0 && memHaveHeaders(mem) == 0)
+ 	    httpReplyParse(mem->reply, sc->copy_buf,
+ 		headersEnd(sc->copy_buf, copy_sz));
++
++#if HTTP_GZIP
++	if (e->http_gzip) {
++	    httpGzipClearHeaders(mem->reply);
++	}
++#endif
++
+ 	storeClientCallback(sc, copy_sz);
+ 	return;
+     }
+diff --git a/src/HttpGzip.h b/src/HttpGzip.h
+new file mode 100644
+index 0000000..b28c891
+--- /dev/null
++++ b/src/HttpGzip.h
+@@ -0,0 +1,34 @@
++
++#ifndef SQUID_HTTP_GZIP_H
++#define SQUID_HTTP_GZIP_H
++
++#include "squid.h"
++#include <zlib.h>
++
++typedef struct {
++    z_stream        zstream;
++    unsigned char  *gzipBuffer;
++    unsigned int    checksum;
++    unsigned int    allocated;
++    unsigned int    increment;
++    unsigned int    originalSize;
++    unsigned int    compressedSize;
++    unsigned int    sendingOffset;
++    unsigned int    lastChunkSize;
++} HttpGzipContext;
++
++int httpGzipNeed(request_t *request, HttpReply *reply);
++
++void httpGzipClearHeaders(HttpReply *reply);
++
++void httpGzipStart(HttpStateData *httpState);
++
++void * httpGzipContextInitialize();
++
++void httpGzipContextFinalize(HttpStateData *httpState);
++
++int httpGzipCompress(HttpStateData *httpState, const char *buf, ssize_t len);
++
++int httpGzipDone(HttpStateData *httpState);
++
++#endif /* SQUID_HTTP_GZIP_H */
+diff --git a/src/HttpGzip.c b/src/HttpGzip.c
+new file mode 100644
+index 0000000..e7e5f21
+--- /dev/null
++++ b/src/HttpGzip.c
+@@ -0,0 +1,291 @@
++
++#include "HttpGzip.h"
++#include <stdlib.h>
++
++
++int 
++httpGzipNeed(request_t *request, HttpReply *reply)
++{
++    char *type_list = "text/html";
++
++    String s;
++    HttpHeader *header;
++
++    header = &request->header;
++
++    /**
++     * Checks the request's Accept-Encoding header if the client does understand
++     * gzip compression at all.
++     */
++    s = httpHeaderGetStrOrList(header, HDR_ACCEPT_ENCODING);
++    if (strBuf(s) == NULL || strStr(s, "gzip") == NULL ){
++	return 0;
++    }
++
++    header = &reply->header;
++    /**
++     * Checks if the response Cache-Control header allows transformation of the
++     * response.
++     */
++    s = httpHeaderGetStrOrList(header, HDR_CACHE_CONTROL);
++    if (strBuf(s) != NULL && strStr(s, "no-transform") != NULL ){
++	return 0;
++    }
++
++    /**
++     * Do not compress if response has a content-range header and status code "206
++     * Partial content". 
++     */
++    if (httpHeaderHas(header, HDR_CONTENT_RANGE)) {
++	return 0;
++    }
++
++    /**
++     * Checks the Content-Type response header.
++     * At this time, only responses with "text/html" content-type are allowed to
++     * be compressed.
++     */
++    if (Config.http_gzip.types != NULL) {
++	type_list = Config.http_gzip.types;
++    }
++
++    s = httpHeaderGetStrOrList(header, HDR_CONTENT_TYPE);
++    if (strBuf(s) == NULL || strstr(type_list, strBuf(s)) == NULL ){
++	return 0;
++    }
++
++    /**
++     * Checks the Content-Encoding response header.
++     * If this header is present, we must not compress the respone.
++     */
++    if (httpHeaderHas(header, HDR_CONTENT_ENCODING)) {
++	return 0;
++    }
++
++    if (reply->content_length != -1 && 
++	    reply->content_length < Config.http_gzip.min_length) {
++	return 0;
++    }
++
++    return 1;
++}
++
++void 
++httpGzipClearHeaders(HttpReply *reply) 
++{
++
++    HttpHeader *header;
++    header = &reply->header;
++
++    /* delete ContentLength header because we may change the length */
++    reply->content_length = -1;
++    httpHeaderDelById(header, HDR_CONTENT_LENGTH);
++
++    /* Add "Vary: Accept-Encoding" response header" */
++    httpHeaderPutStr(header, HDR_VARY, "Accept-Encoding");
++
++    httpHeaderDelById(header, HDR_CONTENT_LOCATION);
++
++    httpHeaderDelById(header, HDR_ETAG);
++
++    httpHeaderPutStr(header, HDR_CONTENT_ENCODING, "gzip");
++
++    httpHeaderPutStr(header, HDR_WARNING, "214 Transformation applied");
++
++    return;
++}
++
++void 
++httpGzipStart(HttpStateData *httpState)
++{
++    StoreEntry *entry = httpState->entry;
++    request_t *request = httpState->orig_request;
++    HttpReply *reply = entry->mem_obj->reply;
++
++    if (!httpGzipNeed(request, reply)) {
++	return;
++    }
++
++    httpState->context = httpGzipContextInitialize();
++
++    if (httpState->context) {
++	httpGzipClearHeaders(reply);
++	entry->http_gzip = 1;
++    }
++
++    return;
++}
++
++void * 
++httpGzipContextInitialize()
++{
++    HttpGzipContext *ctx = NULL;
++
++    ctx = (HttpGzipContext *) xmalloc(sizeof(HttpGzipContext));
++
++    if (ctx) {
++	memset(ctx, 0, sizeof(HttpGzipContext));
++
++	ctx->checksum = crc32(0, Z_NULL, 0);
++	if (deflateInit2(&ctx->zstream, Config.http_gzip.level, Z_DEFLATED, 
++		    -(Config.http_gzip.wbits), Config.http_gzip.memlevel, 
++		    Z_DEFAULT_STRATEGY) != Z_OK){
++	    return NULL;
++	}
++
++	/*
++	 * We preallocate a memory for zlib in one buffer (default:256K), this
++	 * decreases a number of malloc() and free() calls and also probably
++	 * decreases a number of syscalls (sbrk()/mmap() and so on).
++	 * Besides we free the memory as soon as a gzipping will complete
++	 * and do not wait while a whole response will be sent to a client.
++	 */
++	ctx->allocated = Config.http_gzip.prealloc_size;
++	ctx->increment = getpagesize();
++	ctx->gzipBuffer = (unsigned char *) xmalloc(ctx->allocated);
++	if (ctx->gzipBuffer == NULL) {
++	    return NULL;
++	}
++
++	ctx->zstream.total_out = 0;
++    }
++
++    return ctx;
++}
++
++void 
++httpGzipContextFinalize(HttpStateData *httpState)
++{
++    HttpGzipContext *ctx = (HttpGzipContext *)httpState->context;
++
++    if (ctx != NULL) {
++	if (ctx->gzipBuffer != NULL) {
++	    xfree(ctx->gzipBuffer);
++	}
++
++	xfree(httpState->context);
++    }
++
++    httpState->context = NULL;
++}
++
++static int 
++httpGzipIncreaseBuffer(HttpGzipContext *ctx)
++{
++    ctx->allocated += ctx->increment;
++    ctx->gzipBuffer = (unsigned char *) xrealloc(ctx->gzipBuffer, ctx->allocated);
++    if (ctx->gzipBuffer == NULL) {
++	return -1;
++    }
++
++    ctx->compressedSize = ctx->zstream.total_out + 10;
++
++    /*increase the increment memory twice each time*/
++    ctx->increment <<= 1;
++
++    return 0;
++}
++
++int
++httpGzipCompress(HttpStateData *httpState, const char *buf, ssize_t len)
++{
++    HttpGzipContext *ctx = httpState->context;
++
++    ctx->originalSize += len;
++    ctx->lastChunkSize = len;
++
++    ctx->checksum = crc32(ctx->checksum, (unsigned char *)buf, len);
++
++    if (ctx->gzipBuffer == NULL) {
++	return -1;
++    }
++
++    if (ctx->originalSize == len) {
++	ctx->gzipBuffer[0] = (unsigned char)31;         //Magic number #1
++	ctx->gzipBuffer[1] = (unsigned char)139;        //Magic number #2
++	ctx->gzipBuffer[2] = (unsigned char)Z_DEFLATED; //Method
++	ctx->gzipBuffer[3] = (unsigned char)0;          //Flags
++	ctx->gzipBuffer[4] = (unsigned char)0;	        //Mtime #1
++	ctx->gzipBuffer[5] = (unsigned char)0;	        //Mtime #2
++	ctx->gzipBuffer[6] = (unsigned char)0;          //Mtime #3
++	ctx->gzipBuffer[7] = (unsigned char)0;          //Mtime #4
++	ctx->gzipBuffer[8] = (unsigned char)0;          //Extra flags
++	ctx->gzipBuffer[9] = (unsigned char)3;          //Operatin system: UNIX
++
++	ctx->compressedSize = 10;
++    }
++
++    ctx->zstream.next_in    = (unsigned char *)buf;
++    ctx->zstream.avail_in   = len;
++
++    while (1) {
++	ctx->zstream.next_out   = &ctx->gzipBuffer[ctx->compressedSize];
++	ctx->zstream.avail_out  = ctx->allocated - ctx->compressedSize;
++
++	if (deflate(&ctx->zstream, Z_NO_FLUSH) != Z_OK) {
++	    return -1;
++	}
++
++	if (ctx->zstream.avail_out == 0) {
++	    httpGzipIncreaseBuffer(ctx);
++	    continue;
++	}
++
++	break;
++    }
++
++    ctx->compressedSize = ctx->zstream.total_out + 10;
++
++    return 0;
++}
++
++int
++httpGzipDone(HttpStateData *httpState)
++{
++    int rc;
++    StoreEntry *entry = httpState->entry;
++    HttpReply *reply = entry->mem_obj->reply;
++    HttpGzipContext *ctx = httpState->context;
++
++    while (1) {
++	rc = deflate(&ctx->zstream, Z_FINISH);
++
++	if (rc == Z_STREAM_END) {
++	    break;
++	}
++	else if (rc == Z_OK ){
++	    if (ctx->zstream.avail_out == 0) {
++		httpGzipIncreaseBuffer(ctx);
++		ctx->zstream.next_out   = &ctx->gzipBuffer[ctx->compressedSize];
++		ctx->zstream.avail_out  = ctx->allocated - ctx->compressedSize;
++	    }
++
++	    continue;
++	}
++	else {
++	    return -1;
++	}
++    }
++
++    if (deflateEnd(&ctx->zstream) != Z_OK) {
++	return -1;
++    }
++
++    ctx->compressedSize = ctx->zstream.total_out + 10;
++
++    /*GZIP Footer*/
++    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) ctx->checksum & 0xff;
++    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->checksum >> 8) & 0xff;
++    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->checksum >> 16)  & 0xff;
++    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->checksum >> 24)  & 0xff;
++
++    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) ctx->originalSize & 0xff;
++    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->originalSize >> 8) & 0xff;
++    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->originalSize >> 16) & 0xff;
++    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->originalSize >> 24) & 0xff;
++
++    reply->content_length = ctx->compressedSize;
++    httpHeaderPutSize(&reply->header, HDR_CONTENT_LENGTH, reply->content_length);
++
++    return 0;
++}
