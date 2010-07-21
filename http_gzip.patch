@@ -164,7 +164,7 @@ index c187f56..0fcf93f 100644
  
  struct _SwapDir {
 diff --git a/src/http.c b/src/http.c
-index 1b7c36a..b581391 100644
+index 1b7c36a..fa5197a 100644
 --- a/src/http.c
 +++ b/src/http.c
 @@ -40,6 +40,10 @@
@@ -287,10 +287,10 @@ index 1b7c36a..b581391 100644
 +	    comm_close(fd);
 +	}
 +
-+	debug(11, 2) ("httpGzipDone: gzip context's checksum:%x, "
-+		"original:%x, compressed:%d, total_out: %d, avail_out: %d\n", 
-+		ctx->checksum, ctx->originalSize, ctx->compressedSize,
-+	       	ctx->zstream.total_out, ctx->zstream.avail_out);
++	debug(11, 2) ("httpGzipDone: gzip context's checksum:%x, original:%x, compressed:%d,"
++		" total_out: %d, avail_out: %d\n", 
++		ctx->checksum, ctx->originalSize, ctx->compressedSize, 
++		ctx->zstream.total_out, ctx->zstream.avail_out);
 +
 +	storeAppend(httpState->entry, (char *)ctx->gzipBuffer, ctx->compressedSize);
 +
@@ -332,7 +332,7 @@ index 4c94a9a..68376c3 100644
      STORE_LOG_CREATE,
      STORE_LOG_SWAPIN,
 diff --git a/src/store_client.c b/src/store_client.c
-index 8185e3b..e91483e 100644
+index 8185e3b..b013599 100644
 --- a/src/store_client.c
 +++ b/src/store_client.c
 @@ -35,6 +35,10 @@
@@ -353,7 +353,7 @@ index 8185e3b..e91483e 100644
 +#if HTTP_GZIP
 +	case STORE_META_GZIP:
 +
-+	    debug(20, 2) ("Got STORE_META_GZIP: %s\n", t->value);
++	    debug(20, 2) ("Got STORE_META_GZIP: %s\n", (char *)t->value);
 +
 +	    if (strcmp("gzip", t->value) == 0) {
 +		e->http_gzip = 1;
@@ -364,7 +364,7 @@ index 8185e3b..e91483e 100644
  	case STORE_META_VARY_HEADERS:
  	    if (mem->vary_headers) {
  		if (strcmp(mem->vary_headers, t->value) != 0)
-@@ -509,6 +524,13 @@ storeClientReadHeader(void *data, const char *buf, ssize_t len)
+@@ -509,6 +524,16 @@ storeClientReadHeader(void *data, const char *buf, ssize_t len)
  	if (sc->copy_offset == 0 && len > 0 && memHaveHeaders(mem) == 0)
  	    httpReplyParse(mem->reply, sc->copy_buf,
  		headersEnd(sc->copy_buf, copy_sz));
@@ -373,11 +373,38 @@ index 8185e3b..e91483e 100644
 +	if (e->http_gzip) {
 +	    httpGzipClearHeaders(mem->reply);
 +	}
++	if (mem->vary_headers) {
++	    httpHeaderDelById(&mem->reply->header, HDR_ETAG);
++	}
 +#endif
 +
  	storeClientCallback(sc, copy_sz);
  	return;
      }
+diff --git a/src/store.c b/src/store.c
+index 33638f7..6154e48 100644
+--- a/src/store.c
++++ b/src/store.c
+@@ -888,6 +888,9 @@ storeLocateVaryRead(void *data, char *buf, ssize_t size)
+ 	} else if (strmatchbeg(p, "ETag: ", l) == 0) {
+ 	    /* etag field */
+ 	    char *etag;
++#if HTTP_GZIP
++	    if (!Config.http_gzip.enable) {
++#endif
+ 	    if (state->current.encoding_ok) {
+ 		p2 = p + 6;
+ 		l2 = e - p2;
+@@ -900,6 +903,9 @@ storeLocateVaryRead(void *data, char *buf, ssize_t size)
+ 	    } else {
+ 		state->current.ignore = 1;
+ 	    }
++#if HTTP_GZIP
++	    }
++#endif
+ 	} else if (strmatchbeg(p, "VaryData: ", l) == 0) {
+ 	    /* vary field */
+ 	    p2 = p + 10;
 diff --git a/src/store_swapmeta.c b/src/store_swapmeta.c
 index a3cc1b2..c19de7e 100644
 --- a/src/store_swapmeta.c
@@ -398,10 +425,10 @@ index a3cc1b2..c19de7e 100644
  	T = storeSwapTLVAdd(STORE_META_VARY_HEADERS, vary, strlen(vary) + 1, T);
 diff --git a/src/HttpGzip.h b/src/HttpGzip.h
 new file mode 100644
-index 0000000..b28c891
+index 0000000..2068362
 --- /dev/null
 +++ b/src/HttpGzip.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,33 @@
 +
 +#ifndef SQUID_HTTP_GZIP_H
 +#define SQUID_HTTP_GZIP_H
@@ -414,7 +441,6 @@ index 0000000..b28c891
 +    unsigned char  *gzipBuffer;
 +    unsigned int    checksum;
 +    unsigned int    allocated;
-+    unsigned int    increment;
 +    unsigned int    originalSize;
 +    unsigned int    compressedSize;
 +    unsigned int    sendingOffset;
@@ -438,10 +464,10 @@ index 0000000..b28c891
 +#endif /* SQUID_HTTP_GZIP_H */
 diff --git a/src/HttpGzip.c b/src/HttpGzip.c
 new file mode 100644
-index 0000000..e7e5f21
+index 0000000..199cba8
 --- /dev/null
 +++ b/src/HttpGzip.c
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,290 @@
 +
 +#include "HttpGzip.h"
 +#include <stdlib.h>
@@ -517,7 +543,7 @@ index 0000000..e7e5f21
 +void 
 +httpGzipClearHeaders(HttpReply *reply) 
 +{
-+
++    String s;
 +    HttpHeader *header;
 +    header = &reply->header;
 +
@@ -526,7 +552,10 @@ index 0000000..e7e5f21
 +    httpHeaderDelById(header, HDR_CONTENT_LENGTH);
 +
 +    /* Add "Vary: Accept-Encoding" response header" */
-+    httpHeaderPutStr(header, HDR_VARY, "Accept-Encoding");
++    s = httpHeaderGetStrOrList(header, HDR_VARY);
++    if (strBuf(s) == NULL || strStr(s, "Accept-Encoding") == NULL ){
++	httpHeaderPutStr(header, HDR_VARY, "Accept-Encoding");
++    }
 +
 +    httpHeaderDelById(header, HDR_CONTENT_LOCATION);
 +
@@ -585,7 +614,6 @@ index 0000000..e7e5f21
 +	 * and do not wait while a whole response will be sent to a client.
 +	 */
 +	ctx->allocated = Config.http_gzip.prealloc_size;
-+	ctx->increment = getpagesize();
 +	ctx->gzipBuffer = (unsigned char *) xmalloc(ctx->allocated);
 +	if (ctx->gzipBuffer == NULL) {
 +	    return NULL;
@@ -616,16 +644,13 @@ index 0000000..e7e5f21
 +static int 
 +httpGzipIncreaseBuffer(HttpGzipContext *ctx)
 +{
-+    ctx->allocated += ctx->increment;
++    ctx->allocated <<= 1;
 +    ctx->gzipBuffer = (unsigned char *) xrealloc(ctx->gzipBuffer, ctx->allocated);
 +    if (ctx->gzipBuffer == NULL) {
 +	return -1;
 +    }
 +
 +    ctx->compressedSize = ctx->zstream.total_out + 10;
-+
-+    /*increase the increment memory twice each time*/
-+    ctx->increment <<= 1;
 +
 +    return 0;
 +}
