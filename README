@@ -1,5 +1,13 @@
 This patch add the feature of http compression on the fly for squid-2.7
 
+=STATUS=
+This patch is at its very early phase of development and considered
+highly experimental. But you're encouraged to test it out on your side
+and report any quirks that you experience.
+
+We need your help! If you find this module useful and/or interesting,
+please consider joining the development!
+
 =INSTALLATION=
 
 Get the source from http://github.com/yaoweibin/squid_gzip
