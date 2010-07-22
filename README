@@ -2,6 +2,8 @@ This patch add the feature of http compression on the fly for squid-2.7
 
 =INSTALLATION=
 
+Get the source from http://github.com/yaoweibin/squid_gzip
+
 cd squid-2.7
 patch -p1 < /path/to/http_gzip.patch
 
@@ -9,7 +11,7 @@ compile squid with the following command:
 
 ./bootstrap.sh && ./configure --enable-http-gzip && make
 
-=example=
+=EXAMPLE=
 
 <code>
 http_gzip on
