@@ -1,6 +1,7 @@
 This patch add the feature of http compression on the fly for squid-2.7
 
 =STATUS=
+
 This patch is at its very early phase of development and considered
 highly experimental. But you're encouraged to test it out on your side
 and report any quirks that you experience.
@@ -20,7 +21,7 @@ compile squid with the following command:
 ./bootstrap.sh && ./configure --enable-http-gzip && make
 
 =EXAMPLE=
-
+I have tested in accelerator mode.
 <code>
 http_gzip on
 http_gzip_types text/html,text/plain
@@ -85,7 +86,7 @@ http_gzip_types text/html,text/plain
 =TODO=
 * add deflate 
 
-=LINCENSE=
+=LICENSE=
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License (version 2) as

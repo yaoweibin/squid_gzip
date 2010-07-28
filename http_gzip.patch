@@ -164,7 +164,7 @@ index c187f56..0fcf93f 100644
  
  struct _SwapDir {
 diff --git a/src/http.c b/src/http.c
-index 1b7c36a..fa5197a 100644
+index 1b7c36a..7c0b921 100644
 --- a/src/http.c
 +++ b/src/http.c
 @@ -40,6 +40,10 @@
@@ -209,18 +209,40 @@ index 1b7c36a..fa5197a 100644
      if (httpHeaderHas(&reply->header, HDR_VARY)
  #if X_ACCELERATOR_VARY
  	|| httpHeaderHas(&reply->header, HDR_X_ACCELERATOR_VARY)
-@@ -669,12 +690,42 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
+@@ -657,6 +678,12 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
+     int fd = httpState->fd;
+     int complete = httpState->eof;
+     int keep_alive = !httpState->eof;
++#if HTTP_GZIP
++    int rc;
++    HttpGzipContext *ctx;
++    int sync = 0;
++#endif
++
+     storeBuffer(entry);
+     if (len == 0 && httpState->eof && httpState->flags.chunked) {
+ 	fwdFail(httpState->fwd, errorCon(ERR_INVALID_RESP, HTTP_BAD_GATEWAY, httpState->fwd->request));
+@@ -669,12 +696,60 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
  	    if (size > httpState->chunk_size)
  		size = httpState->chunk_size;
  	    httpState->chunk_size -= size;
 +#if HTTP_GZIP
-+	    if (httpState->context) {
-+		if (httpGzipCompress(httpState, buf, len) < 0) {
++	    ctx =  httpState->context;
++	    if (ctx) {
++		rc = httpGzipCompress(httpState, buf, len);
++		if ( rc < 0) {
 +		    debug(11, 1) ("httpGzipCompress error.\n");
 +		    fwdFail(httpState->fwd, errorCon(ERR_INVALID_RESP, 
 +				HTTP_INTERNAL_SERVER_ERROR, httpState->fwd->request));
 +		    comm_close(fd);
 +		    return;
++		}
++		else if (rc == GZIP_SYNC) {
++		    sync = 1;
++		    debug(11, 2) ("httpGzipCompress sync: %u \n", ctx->zstream.total_out);
++		    storeAppend(httpState->entry, (char *) ctx->gzipBuffer,
++			    ctx->zstream.total_out);
++		    httpGzipStreamOutReset(ctx);
 +		}
 +	    }
 +	    else {
@@ -234,14 +256,23 @@ index 1b7c36a..fa5197a 100644
  	} else if (httpState->chunk_size < 0) {
  	    /* non-chunked without content-length */
 +#if HTTP_GZIP
-+	    if (httpState->context) {
-+		if (httpGzipCompress(httpState, buf, len) < 0) {
++	    ctx =  httpState->context;
++	    if (ctx) {
++		rc = httpGzipCompress(httpState, buf, len);
++		if ( rc < 0) {
 +		    debug(11, 1) ("httpGzipCompress error.\n");
++		    fwdFail(httpState->fwd, errorCon(ERR_INVALID_RESP, 
++				HTTP_INTERNAL_SERVER_ERROR, httpState->fwd->request));
++		    comm_close(fd);
++		    return;
 +		}
-+		fwdFail(httpState->fwd, errorCon(ERR_INVALID_RESP, 
-+			    HTTP_INTERNAL_SERVER_ERROR, httpState->fwd->request));
-+		comm_close(fd);
-+		return;
++		else if (rc == GZIP_SYNC) {
++		    sync = 1;
++		    debug(11, 1) ("httpGzipCompress sync: %u \n", ctx->zstream.total_out);
++		    storeAppend(httpState->entry, (char *) ctx->gzipBuffer,
++			    ctx->zstream.total_out);
++		    httpGzipStreamOutReset(ctx);
++		}
 +	    }
 +	    else {
 +		storeAppend(httpState->entry, buf, len);
@@ -252,12 +283,12 @@ index 1b7c36a..fa5197a 100644
  	    len = 0;
  	} else if (httpState->flags.chunked) {
  	    char *eol = memchr(buf, '\n', len);
-@@ -743,7 +794,13 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
+@@ -743,7 +818,13 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
  	    return;
  	}
      }
 +#if HTTP_GZIP
-+    if (httpState->context == NULL) {
++    if (httpState->context == NULL || sync) {
 +	storeBufferFlush(entry);
 +    }
 +#else
@@ -266,7 +297,7 @@ index 1b7c36a..fa5197a 100644
      if (EBIT_TEST(entry->flags, ENTRY_ABORTED)) {
  	/*
  	 * the above storeBufferFlush() call could ABORT this entry,
-@@ -789,6 +846,36 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
+@@ -789,6 +870,39 @@ httpAppendBody(HttpStateData * httpState, const char *buf, ssize_t len, int buff
  	comm_close(fd);
  	return;
      }
@@ -282,8 +313,9 @@ index 1b7c36a..fa5197a 100644
 +		"gzip context's checksum:%x, original:%x, compressed:%d\n", 
 +		ctx->checksum, ctx->originalSize, ctx->compressedSize);
 +
-+	if (httpGzipDone(httpState) < 0) {
-+	    debug(11, 1) ("httpGzipDone error.\n");
++	rc = httpGzipDone(httpState);
++	if (rc < 0) {
++	    debug(11, 1) ("httpGzipDone error. rc: %d\n", rc);
 +	    comm_close(fd);
 +	}
 +
@@ -292,7 +324,9 @@ index 1b7c36a..fa5197a 100644
 +		ctx->checksum, ctx->originalSize, ctx->compressedSize, 
 +		ctx->zstream.total_out, ctx->zstream.avail_out);
 +
-+	storeAppend(httpState->entry, (char *)ctx->gzipBuffer, ctx->compressedSize);
++	if (ctx->zstream.total_out > 0) {
++	    storeAppend(httpState->entry, (char *) ctx->gzipBuffer, ctx->zstream.total_out);
++	}
 +
 +	httpGzipContextFinalize(httpState);
 +
@@ -303,7 +337,7 @@ index 1b7c36a..fa5197a 100644
      /*
       * Verified and done with the reply
       */
-@@ -1498,6 +1585,9 @@ httpStart(FwdState * fwd)
+@@ -1498,6 +1612,9 @@ httpStart(FwdState * fwd)
      httpState->fwd = fwd;
      httpState->entry = fwd->entry;
      httpState->fd = fd;
@@ -425,16 +459,21 @@ index a3cc1b2..c19de7e 100644
  	T = storeSwapTLVAdd(STORE_META_VARY_HEADERS, vary, strlen(vary) + 1, T);
 diff --git a/src/HttpGzip.h b/src/HttpGzip.h
 new file mode 100644
-index 0000000..2068362
+index 0000000..bf470d5
 --- /dev/null
 +++ b/src/HttpGzip.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,42 @@
 +
 +#ifndef SQUID_HTTP_GZIP_H
 +#define SQUID_HTTP_GZIP_H
 +
 +#include "squid.h"
 +#include <zlib.h>
++
++
++#define GZIP_ERROR (-1)
++#define GZIP_OK    (0)
++#define GZIP_SYNC  (1)
 +
 +typedef struct {
 +    z_stream        zstream;
@@ -445,6 +484,8 @@ index 0000000..2068362
 +    unsigned int    compressedSize;
 +    unsigned int    sendingOffset;
 +    unsigned int    lastChunkSize;
++
++    int             flush;  
 +} HttpGzipContext;
 +
 +int httpGzipNeed(request_t *request, HttpReply *reply);
@@ -459,15 +500,17 @@ index 0000000..2068362
 +
 +int httpGzipCompress(HttpStateData *httpState, const char *buf, ssize_t len);
 +
++int httpGzipStreamOutReset(HttpGzipContext *ctx);
++
 +int httpGzipDone(HttpStateData *httpState);
 +
 +#endif /* SQUID_HTTP_GZIP_H */
 diff --git a/src/HttpGzip.c b/src/HttpGzip.c
 new file mode 100644
-index 0000000..199cba8
+index 0000000..db6faa6
 --- /dev/null
 +++ b/src/HttpGzip.c
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,309 @@
 +
 +#include "HttpGzip.h"
 +#include <stdlib.h>
@@ -619,7 +662,20 @@ index 0000000..199cba8
 +	    return NULL;
 +	}
 +
-+	ctx->zstream.total_out = 0;
++	ctx->gzipBuffer[0] = (unsigned char)31;         //Magic number #1
++	ctx->gzipBuffer[1] = (unsigned char)139;        //Magic number #2
++	ctx->gzipBuffer[2] = (unsigned char)Z_DEFLATED; //Method
++	ctx->gzipBuffer[3] = (unsigned char)0;          //Flags
++	ctx->gzipBuffer[4] = (unsigned char)0;	        //Mtime #1
++	ctx->gzipBuffer[5] = (unsigned char)0;	        //Mtime #2
++	ctx->gzipBuffer[6] = (unsigned char)0;          //Mtime #3
++	ctx->gzipBuffer[7] = (unsigned char)0;          //Mtime #4
++	ctx->gzipBuffer[8] = (unsigned char)0;          //Extra flags
++	ctx->gzipBuffer[9] = (unsigned char)3;          //Operatin system: UNIX
++
++	ctx->zstream.total_out = 10;
++
++	ctx->flush = Z_NO_FLUSH;
 +    }
 +
 +    return ctx;
@@ -647,12 +703,17 @@ index 0000000..199cba8
 +    ctx->allocated <<= 1;
 +    ctx->gzipBuffer = (unsigned char *) xrealloc(ctx->gzipBuffer, ctx->allocated);
 +    if (ctx->gzipBuffer == NULL) {
-+	return -1;
++	return GZIP_ERROR;
 +    }
 +
-+    ctx->compressedSize = ctx->zstream.total_out + 10;
-+
 +    return 0;
++}
++
++int
++httpGzipStreamOutReset(HttpGzipContext *ctx) 
++{
++    ctx->compressedSize += ctx->zstream.total_out;
++    ctx->zstream.total_out = 0;
 +}
 +
 +int
@@ -666,46 +727,43 @@ index 0000000..199cba8
 +    ctx->checksum = crc32(ctx->checksum, (unsigned char *)buf, len);
 +
 +    if (ctx->gzipBuffer == NULL) {
-+	return -1;
-+    }
-+
-+    if (ctx->originalSize == len) {
-+	ctx->gzipBuffer[0] = (unsigned char)31;         //Magic number #1
-+	ctx->gzipBuffer[1] = (unsigned char)139;        //Magic number #2
-+	ctx->gzipBuffer[2] = (unsigned char)Z_DEFLATED; //Method
-+	ctx->gzipBuffer[3] = (unsigned char)0;          //Flags
-+	ctx->gzipBuffer[4] = (unsigned char)0;	        //Mtime #1
-+	ctx->gzipBuffer[5] = (unsigned char)0;	        //Mtime #2
-+	ctx->gzipBuffer[6] = (unsigned char)0;          //Mtime #3
-+	ctx->gzipBuffer[7] = (unsigned char)0;          //Mtime #4
-+	ctx->gzipBuffer[8] = (unsigned char)0;          //Extra flags
-+	ctx->gzipBuffer[9] = (unsigned char)3;          //Operatin system: UNIX
-+
-+	ctx->compressedSize = 10;
++	return GZIP_ERROR;
 +    }
 +
 +    ctx->zstream.next_in    = (unsigned char *)buf;
 +    ctx->zstream.avail_in   = len;
 +
 +    while (1) {
-+	ctx->zstream.next_out   = &ctx->gzipBuffer[ctx->compressedSize];
-+	ctx->zstream.avail_out  = ctx->allocated - ctx->compressedSize;
++	ctx->zstream.next_out   = &ctx->gzipBuffer[ctx->zstream.total_out];
++	ctx->zstream.avail_out  = ctx->allocated - ctx->zstream.total_out;
 +
-+	if (deflate(&ctx->zstream, Z_NO_FLUSH) != Z_OK) {
-+	    return -1;
++	if (deflate(&ctx->zstream, ctx->flush) != Z_OK) {
++	    return GZIP_ERROR;
 +	}
 +
 +	if (ctx->zstream.avail_out == 0) {
-+	    httpGzipIncreaseBuffer(ctx);
++	    if (httpGzipIncreaseBuffer(ctx) < 0) {
++		return GZIP_ERROR;
++	    }
++
++	    continue;
++	}
++
++	if (ctx->flush == Z_SYNC_FLUSH) {
++	    ctx->flush = Z_NO_FLUSH;
++	    return GZIP_SYNC;
++	}
++
++	/*flush the buffer when total_out > 3/4 * allocated's buffer.*/
++	if (ctx->zstream.total_out > ((ctx->allocated * 3) >> 2 )) {
++	    ctx->flush = Z_SYNC_FLUSH;
 +	    continue;
 +	}
 +
 +	break;
 +    }
 +
-+    ctx->compressedSize = ctx->zstream.total_out + 10;
-+
-+    return 0;
++    return GZIP_OK;
 +}
 +
 +int
@@ -717,6 +775,9 @@ index 0000000..199cba8
 +    HttpGzipContext *ctx = httpState->context;
 +
 +    while (1) {
++	ctx->zstream.next_out   = &ctx->gzipBuffer[ctx->zstream.total_out];
++	ctx->zstream.avail_out  = ctx->allocated - ctx->zstream.total_out;
++
 +	rc = deflate(&ctx->zstream, Z_FINISH);
 +
 +	if (rc == Z_STREAM_END) {
@@ -724,37 +785,38 @@ index 0000000..199cba8
 +	}
 +	else if (rc == Z_OK ){
 +	    if (ctx->zstream.avail_out == 0) {
-+		httpGzipIncreaseBuffer(ctx);
-+		ctx->zstream.next_out   = &ctx->gzipBuffer[ctx->compressedSize];
-+		ctx->zstream.avail_out  = ctx->allocated - ctx->compressedSize;
++		if (httpGzipIncreaseBuffer(ctx) < 0) {
++		    return GZIP_ERROR;
++		}
++
 +	    }
 +
 +	    continue;
 +	}
 +	else {
-+	    return -1;
++	    return GZIP_ERROR;
 +	}
 +    }
 +
 +    if (deflateEnd(&ctx->zstream) != Z_OK) {
-+	return -1;
++	return GZIP_ERROR;
 +    }
 +
-+    ctx->compressedSize = ctx->zstream.total_out + 10;
-+
 +    /*GZIP Footer*/
-+    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) ctx->checksum & 0xff;
-+    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->checksum >> 8) & 0xff;
-+    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->checksum >> 16)  & 0xff;
-+    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->checksum >> 24)  & 0xff;
++    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) ctx->checksum & 0xff;
++    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 8) & 0xff;
++    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 16)  & 0xff;
++    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 24)  & 0xff;
 +
-+    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) ctx->originalSize & 0xff;
-+    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->originalSize >> 8) & 0xff;
-+    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->originalSize >> 16) & 0xff;
-+    ctx->gzipBuffer[ctx->compressedSize++] = (unsigned char) (ctx->originalSize >> 24) & 0xff;
++    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) ctx->originalSize & 0xff;
++    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 8) & 0xff;
++    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 16) & 0xff;
++    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 24) & 0xff;
++
++    ctx->compressedSize += ctx->zstream.total_out;
 +
 +    reply->content_length = ctx->compressedSize;
 +    httpHeaderPutSize(&reply->header, HDR_CONTENT_LENGTH, reply->content_length);
 +
-+    return 0;
++    return GZIP_OK;
 +}
