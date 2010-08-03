@@ -164,7 +164,7 @@ index c187f56..0fcf93f 100644
  
  struct _SwapDir {
 diff --git a/src/http.c b/src/http.c
-index 1b7c36a..7c0b921 100644
+index 1b7c36a..aec1427 100644
 --- a/src/http.c
 +++ b/src/http.c
 @@ -40,6 +40,10 @@
@@ -229,7 +229,7 @@ index 1b7c36a..7c0b921 100644
 +#if HTTP_GZIP
 +	    ctx =  httpState->context;
 +	    if (ctx) {
-+		rc = httpGzipCompress(httpState, buf, len);
++		rc = httpGzipCompress(httpState, buf, size);
 +		if ( rc < 0) {
 +		    debug(11, 1) ("httpGzipCompress error.\n");
 +		    fwdFail(httpState->fwd, errorCon(ERR_INVALID_RESP, 
