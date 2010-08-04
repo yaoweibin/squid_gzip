@@ -48,10 +48,10 @@ index 3742c44..bc76f24 100644
  	HttpHdrCc.c \
  	HttpHdrRange.c \
 diff --git a/src/cf.data.pre b/src/cf.data.pre
-index 7eb51ba..2e43350 100644
+index 7eb51ba..6334bb1 100644
 --- a/src/cf.data.pre
 +++ b/src/cf.data.pre
-@@ -5703,5 +5703,69 @@ DOC_START
+@@ -5703,5 +5703,91 @@ DOC_START
  	Note: after changing this, Squid service must be restarted.
  DOC_END
  
@@ -63,6 +63,28 @@ index 7eb51ba..2e43350 100644
 +DEFAULT: on
 +DOC_START
 +	switch the http compress option, default is on.
++DOC_END
++
++NAME: http_gzip_prefer_gzip
++COMMENT: on|off
++IFDEF: HTTP_GZIP
++TYPE: onoff
++LOC: Config.http_gzip.prefer_gzip
++DEFAULT: on
++DOC_START
++	sends gzip content to user agents who can accept both 
++	gzip and deflate content
++DOC_END
++
++NAME: http_gzip_prefer_deflate
++COMMENT: on|off
++IFDEF: HTTP_GZIP
++TYPE: onoff
++LOC: Config.http_gzip.prefer_deflate
++DEFAULT: on
++DOC_START
++	sends deflate content to user agents who can accept 
++	both gzip and deflate content
 +DOC_END
 +
 +NAME: http_gzip_types
@@ -122,16 +144,18 @@ index 7eb51ba..2e43350 100644
  
  EOF
 diff --git a/src/structs.h b/src/structs.h
-index c187f56..0fcf93f 100644
+index c187f56..ce3f8f3 100644
 --- a/src/structs.h
 +++ b/src/structs.h
-@@ -842,6 +842,17 @@ struct _SquidConfig {
+@@ -842,6 +842,19 @@ struct _SquidConfig {
      int max_filedescriptors;
      char *accept_filter;
      int incoming_rate;
 +#if HTTP_GZIP
 +    struct {
 +	int enable;
++	int prefer_gzip;
++	int prefer_deflate;
 +	char *types;
 +	int level;
 +	int wbits;
@@ -143,7 +167,7 @@ index c187f56..0fcf93f 100644
  };
  
  struct _SquidConfig2 {
-@@ -1151,6 +1162,9 @@ struct _HttpStateData {
+@@ -1151,6 +1164,9 @@ struct _HttpStateData {
      int body_buf_sz;
      squid_off_t chunk_size;
      String chunkhdr;
@@ -153,18 +177,32 @@ index c187f56..0fcf93f 100644
  };
  
  struct _icpUdpData {
-@@ -1794,6 +1808,9 @@ struct _StoreEntry {
+@@ -1774,6 +1790,13 @@ struct _MemObject {
+     time_t stale_while_revalidate;
+ };
+ 
++#if HTTP_GZIP
++
++#define SQUID_CACHE_GZIP     1
++#define SQUID_CACHE_DEFLATE  2
++
++#endif
++
+ struct _StoreEntry {
+     hash_link hash;		/* must be first */
+     MemObject *mem_obj;
+@@ -1794,6 +1817,9 @@ struct _StoreEntry {
      ping_status_t ping_status:3;
      store_status_t store_status:3;
      swap_status_t swap_status:3;
 +#if HTTP_GZIP
-+    int http_gzip;
++    int compression_type;
 +#endif
  };
  
  struct _SwapDir {
 diff --git a/src/http.c b/src/http.c
-index 1b7c36a..aec1427 100644
+index 1b7c36a..11a48a8 100644
 --- a/src/http.c
 +++ b/src/http.c
 @@ -40,6 +40,10 @@
@@ -199,10 +237,10 @@ index 1b7c36a..aec1427 100644
 +    if (Config.http_gzip.enable && httpState->context == NULL) {
 +	httpGzipStart(httpState);
 +	debug(11, 2) ("httpGzipStart: http_gzip: %d, types: %s, min_length: %d, "
-+		"level: %d, window: %d, hash: %d, context: %p, gzip: %d\n", 
++		"level: %d, window: %d, hash: %d, context: %p, type: %d\n", 
 +		Config.http_gzip.enable, Config.http_gzip.types, Config.http_gzip.min_length,
 +		Config.http_gzip.level, Config.http_gzip.wbits, Config.http_gzip.memlevel,
-+		httpState->context, entry->http_gzip);
++		httpState->context, entry->compression_type);
 +    }
 +#endif
 +
@@ -239,7 +277,7 @@ index 1b7c36a..aec1427 100644
 +		}
 +		else if (rc == GZIP_SYNC) {
 +		    sync = 1;
-+		    debug(11, 2) ("httpGzipCompress sync: %u \n", ctx->zstream.total_out);
++		    debug(11, 2) ("httpGzipCompress sync: %lu \n", ctx->zstream.total_out);
 +		    storeAppend(httpState->entry, (char *) ctx->gzipBuffer,
 +			    ctx->zstream.total_out);
 +		    httpGzipStreamOutReset(ctx);
@@ -268,7 +306,7 @@ index 1b7c36a..aec1427 100644
 +		}
 +		else if (rc == GZIP_SYNC) {
 +		    sync = 1;
-+		    debug(11, 1) ("httpGzipCompress sync: %u \n", ctx->zstream.total_out);
++		    debug(11, 1) ("httpGzipCompress sync: %lu \n", ctx->zstream.total_out);
 +		    storeAppend(httpState->entry, (char *) ctx->gzipBuffer,
 +			    ctx->zstream.total_out);
 +		    httpGzipStreamOutReset(ctx);
@@ -319,8 +357,8 @@ index 1b7c36a..aec1427 100644
 +	    comm_close(fd);
 +	}
 +
-+	debug(11, 2) ("httpGzipDone: gzip context's checksum:%x, original:%x, compressed:%d,"
-+		" total_out: %d, avail_out: %d\n", 
++	debug(11, 2) ("httpGzipDone: gzip context's checksum:%x, original:%x, compressed:%u,"
++		" total_out: %lu, avail_out: %u\n", 
 +		ctx->checksum, ctx->originalSize, ctx->compressedSize, 
 +		ctx->zstream.total_out, ctx->zstream.avail_out);
 +
@@ -366,7 +404,7 @@ index 4c94a9a..68376c3 100644
      STORE_LOG_CREATE,
      STORE_LOG_SWAPIN,
 diff --git a/src/store_client.c b/src/store_client.c
-index 8185e3b..b013599 100644
+index 8185e3b..2b78ee7 100644
 --- a/src/store_client.c
 +++ b/src/store_client.c
 @@ -35,6 +35,10 @@
@@ -380,7 +418,7 @@ index 8185e3b..b013599 100644
  /*
   * NOTE: 'Header' refers to the swapfile metadata header.
   *       'Body' refers to the swapfile body, which is the full
-@@ -432,6 +436,17 @@ storeClientReadHeader(void *data, const char *buf, ssize_t len)
+@@ -432,6 +436,20 @@ storeClientReadHeader(void *data, const char *buf, ssize_t len)
  	case STORE_META_STD:
  	case STORE_META_STD_LFS:
  	    break;
@@ -390,7 +428,10 @@ index 8185e3b..b013599 100644
 +	    debug(20, 2) ("Got STORE_META_GZIP: %s\n", (char *)t->value);
 +
 +	    if (strcmp("gzip", t->value) == 0) {
-+		e->http_gzip = 1;
++		e->compression_type = SQUID_CACHE_GZIP;
++	    }
++	    else if (strcmp("deflate", t->value) == 0) {
++		e->compression_type = SQUID_CACHE_DEFLATE;
 +	    }
 +
 +	    break;
@@ -398,15 +439,16 @@ index 8185e3b..b013599 100644
  	case STORE_META_VARY_HEADERS:
  	    if (mem->vary_headers) {
  		if (strcmp(mem->vary_headers, t->value) != 0)
-@@ -509,6 +524,16 @@ storeClientReadHeader(void *data, const char *buf, ssize_t len)
+@@ -509,6 +527,17 @@ storeClientReadHeader(void *data, const char *buf, ssize_t len)
  	if (sc->copy_offset == 0 && len > 0 && memHaveHeaders(mem) == 0)
  	    httpReplyParse(mem->reply, sc->copy_buf,
  		headersEnd(sc->copy_buf, copy_sz));
 +
 +#if HTTP_GZIP
-+	if (e->http_gzip) {
-+	    httpGzipClearHeaders(mem->reply);
++	if (e->compression_type) {
++	    httpGzipClearHeaders(mem->reply, e->compression_type);
 +	}
++
 +	if (mem->vary_headers) {
 +	    httpHeaderDelById(&mem->reply->header, HDR_ETAG);
 +	}
@@ -440,17 +482,20 @@ index 33638f7..6154e48 100644
  	    /* vary field */
  	    p2 = p + 10;
 diff --git a/src/store_swapmeta.c b/src/store_swapmeta.c
-index a3cc1b2..c19de7e 100644
+index a3cc1b2..ef1b2a9 100644
 --- a/src/store_swapmeta.c
 +++ b/src/store_swapmeta.c
-@@ -83,6 +83,13 @@ storeSwapMetaBuild(StoreEntry * e)
+@@ -83,6 +83,16 @@ storeSwapMetaBuild(StoreEntry * e)
      if (objsize > -1) {
  	T = storeSwapTLVAdd(STORE_META_OBJSIZE, &objsize, sizeof(objsize), T);
      }
 +
 +#if HTTP_GZIP
-+    if (e->http_gzip) {
++    if (e->compression_type & SQUID_CACHE_GZIP) {
 +	T = storeSwapTLVAdd(STORE_META_GZIP, "gzip", sizeof("gzip"), T);
++    }
++    else if (e->compression_type & SQUID_CACHE_DEFLATE) {
++	T = storeSwapTLVAdd(STORE_META_GZIP, "deflate", sizeof("deflate"), T);
 +    }
 +#endif
 +
@@ -459,10 +504,10 @@ index a3cc1b2..c19de7e 100644
  	T = storeSwapTLVAdd(STORE_META_VARY_HEADERS, vary, strlen(vary) + 1, T);
 diff --git a/src/HttpGzip.h b/src/HttpGzip.h
 new file mode 100644
-index 0000000..bf470d5
+index 0000000..ac2e26f
 --- /dev/null
 +++ b/src/HttpGzip.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,43 @@
 +
 +#ifndef SQUID_HTTP_GZIP_H
 +#define SQUID_HTTP_GZIP_H
@@ -485,12 +530,13 @@ index 0000000..bf470d5
 +    unsigned int    sendingOffset;
 +    unsigned int    lastChunkSize;
 +
++    int             compression_type;
 +    int             flush;  
 +} HttpGzipContext;
 +
 +int httpGzipNeed(request_t *request, HttpReply *reply);
 +
-+void httpGzipClearHeaders(HttpReply *reply);
++void httpGzipClearHeaders(HttpReply *reply, int type);
 +
 +void httpGzipStart(HttpStateData *httpState);
 +
@@ -507,10 +553,10 @@ index 0000000..bf470d5
 +#endif /* SQUID_HTTP_GZIP_H */
 diff --git a/src/HttpGzip.c b/src/HttpGzip.c
 new file mode 100644
-index 0000000..db6faa6
+index 0000000..b1c3a9c
 --- /dev/null
 +++ b/src/HttpGzip.c
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,349 @@
 +
 +#include "HttpGzip.h"
 +#include <stdlib.h>
@@ -531,7 +577,8 @@ index 0000000..db6faa6
 +     * gzip compression at all.
 +     */
 +    s = httpHeaderGetStrOrList(header, HDR_ACCEPT_ENCODING);
-+    if (strBuf(s) == NULL || strStr(s, "gzip") == NULL ){
++    if (strBuf(s) == NULL ||
++	    (strStr(s, "gzip") == NULL && strStr(s, "deflate") == NULL) ){
 +	return 0;
 +    }
 +
@@ -584,7 +631,7 @@ index 0000000..db6faa6
 +}
 +
 +void 
-+httpGzipClearHeaders(HttpReply *reply) 
++httpGzipClearHeaders(HttpReply *reply, int type) 
 +{
 +    String s;
 +    HttpHeader *header;
@@ -604,7 +651,12 @@ index 0000000..db6faa6
 +
 +    httpHeaderDelById(header, HDR_ETAG);
 +
-+    httpHeaderPutStr(header, HDR_CONTENT_ENCODING, "gzip");
++    if (type & SQUID_CACHE_GZIP) {
++	httpHeaderPutStr(header, HDR_CONTENT_ENCODING, "gzip");
++    }
++    else if (type & SQUID_CACHE_DEFLATE) {
++	httpHeaderPutStr(header, HDR_CONTENT_ENCODING, "deflate");
++    }
 +
 +    httpHeaderPutStr(header, HDR_WARNING, "214 Transformation applied");
 +
@@ -617,35 +669,57 @@ index 0000000..db6faa6
 +    StoreEntry *entry = httpState->entry;
 +    request_t *request = httpState->orig_request;
 +    HttpReply *reply = entry->mem_obj->reply;
++    HttpGzipContext *ctx = NULL;
 +
 +    if (!httpGzipNeed(request, reply)) {
 +	return;
 +    }
 +
-+    httpState->context = httpGzipContextInitialize();
++    ctx = httpGzipContextInitialize(request);
 +
-+    if (httpState->context) {
-+	httpGzipClearHeaders(reply);
-+	entry->http_gzip = 1;
++    if (ctx) {
++	httpGzipClearHeaders(reply, ctx->compression_type);
++	entry->compression_type = ctx->compression_type;
 +    }
++
++    httpState->context = ctx;
 +
 +    return;
 +}
 +
 +void * 
-+httpGzipContextInitialize()
++httpGzipContextInitialize(request_t *request)
 +{
++    String s;
++    int gzip, deflate;
 +    HttpGzipContext *ctx = NULL;
++    HttpHeader *header;
++
 +
 +    ctx = (HttpGzipContext *) xmalloc(sizeof(HttpGzipContext));
 +
 +    if (ctx) {
 +	memset(ctx, 0, sizeof(HttpGzipContext));
 +
-+	ctx->checksum = crc32(0, Z_NULL, 0);
-+	if (deflateInit2(&ctx->zstream, Config.http_gzip.level, Z_DEFLATED, 
-+		    -(Config.http_gzip.wbits), Config.http_gzip.memlevel, 
-+		    Z_DEFAULT_STRATEGY) != Z_OK){
++	gzip = deflate = 0;
++	header = &request->header;
++	s = httpHeaderGetStrOrList(header, HDR_ACCEPT_ENCODING);
++	if ( strStr(s, "gzip") != NULL) {
++	    gzip = 1;
++	} 
++
++	if (strStr(s, "deflate") != NULL){
++	    deflate = 1;
++	}
++
++	if (deflate && Config.http_gzip.prefer_deflate) {
++	    ctx->compression_type = SQUID_CACHE_DEFLATE;
++	}
++	else if (gzip && Config.http_gzip.prefer_gzip) {
++	    ctx->compression_type = SQUID_CACHE_GZIP;
++	}
++	else {
++	    /*This could not happen.*/
 +	    return NULL;
 +	}
 +
@@ -662,18 +736,28 @@ index 0000000..db6faa6
 +	    return NULL;
 +	}
 +
-+	ctx->gzipBuffer[0] = (unsigned char)31;         //Magic number #1
-+	ctx->gzipBuffer[1] = (unsigned char)139;        //Magic number #2
-+	ctx->gzipBuffer[2] = (unsigned char)Z_DEFLATED; //Method
-+	ctx->gzipBuffer[3] = (unsigned char)0;          //Flags
-+	ctx->gzipBuffer[4] = (unsigned char)0;	        //Mtime #1
-+	ctx->gzipBuffer[5] = (unsigned char)0;	        //Mtime #2
-+	ctx->gzipBuffer[6] = (unsigned char)0;          //Mtime #3
-+	ctx->gzipBuffer[7] = (unsigned char)0;          //Mtime #4
-+	ctx->gzipBuffer[8] = (unsigned char)0;          //Extra flags
-+	ctx->gzipBuffer[9] = (unsigned char)3;          //Operatin system: UNIX
++	if (deflateInit2(&ctx->zstream, Config.http_gzip.level, Z_DEFLATED, 
++		    -(Config.http_gzip.wbits), Config.http_gzip.memlevel, 
++		    Z_DEFAULT_STRATEGY) != Z_OK){
++	    return NULL;
++	}
 +
-+	ctx->zstream.total_out = 10;
++	if (!(ctx->compression_type & SQUID_CACHE_DEFLATE)) {
++	    ctx->checksum = crc32(0, Z_NULL, 0);
++
++	    ctx->gzipBuffer[0] = (unsigned char)31;         //Magic number #1
++	    ctx->gzipBuffer[1] = (unsigned char)139;        //Magic number #2
++	    ctx->gzipBuffer[2] = (unsigned char)Z_DEFLATED; //Method
++	    ctx->gzipBuffer[3] = (unsigned char)0;          //Flags
++	    ctx->gzipBuffer[4] = (unsigned char)0;	    //Mtime #1
++	    ctx->gzipBuffer[5] = (unsigned char)0;	    //Mtime #2
++	    ctx->gzipBuffer[6] = (unsigned char)0;          //Mtime #3
++	    ctx->gzipBuffer[7] = (unsigned char)0;          //Mtime #4
++	    ctx->gzipBuffer[8] = (unsigned char)0;          //Extra flags
++	    ctx->gzipBuffer[9] = (unsigned char)3;          //Operatin system: UNIX
++
++	    ctx->zstream.total_out = 10;
++	}
 +
 +	ctx->flush = Z_NO_FLUSH;
 +    }
@@ -714,6 +798,8 @@ index 0000000..db6faa6
 +{
 +    ctx->compressedSize += ctx->zstream.total_out;
 +    ctx->zstream.total_out = 0;
++
++    return 0;
 +}
 +
 +int
@@ -724,10 +810,8 @@ index 0000000..db6faa6
 +    ctx->originalSize += len;
 +    ctx->lastChunkSize = len;
 +
-+    ctx->checksum = crc32(ctx->checksum, (unsigned char *)buf, len);
-+
-+    if (ctx->gzipBuffer == NULL) {
-+	return GZIP_ERROR;
++    if (!(ctx->compression_type & SQUID_CACHE_DEFLATE)) {
++	ctx->checksum = crc32(ctx->checksum, (unsigned char *)buf, len);
 +    }
 +
 +    ctx->zstream.next_in    = (unsigned char *)buf;
@@ -803,15 +887,17 @@ index 0000000..db6faa6
 +    }
 +
 +    /*GZIP Footer*/
-+    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) ctx->checksum & 0xff;
-+    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 8) & 0xff;
-+    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 16)  & 0xff;
-+    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 24)  & 0xff;
++    if (!(ctx->compression_type & SQUID_CACHE_DEFLATE)) {
++	ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) ctx->checksum & 0xff;
++	ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 8) & 0xff;
++	ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 16)  & 0xff;
++	ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->checksum >> 24)  & 0xff;
 +
-+    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) ctx->originalSize & 0xff;
-+    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 8) & 0xff;
-+    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 16) & 0xff;
-+    ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 24) & 0xff;
++	ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) ctx->originalSize & 0xff;
++	ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 8) & 0xff;
++	ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 16) & 0xff;
++	ctx->gzipBuffer[ctx->zstream.total_out++] = (unsigned char) (ctx->originalSize >> 24) & 0xff;
++    }
 +
 +    ctx->compressedSize += ctx->zstream.total_out;
 +

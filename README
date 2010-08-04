@@ -34,6 +34,21 @@ http_gzip_types text/html,text/plain
     context: main
     description: switch the http compression 
 
+    ==http_gzip_prefer_gzip==
+    syntax: http_gzip_prefer_gzip on|off
+    default: on
+    context: main
+    description: sends gzip content to user agents who can accept both 
+    gzip and deflate content.
+
+    ==http_gzip_prefer_deflate==
+    syntax: http_gzip_prefer_deflate on|off
+    default: on
+    context: main
+    description: sends deflate content to user agents who can accept 
+    both gzip and deflate content. If prefer_deflate and perfer_gzip are
+    both on. deflate is higher priority than gzip.
+
     ==http_gzip_types==
     syntax: http_gzip_types [mime types]
     default: text/html
