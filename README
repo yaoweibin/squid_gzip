@@ -1,4 +1,4 @@
-This patch add the feature of http compression on the fly for squid-2.7
+This patch adds the feature of http compression on the fly for squid-2.7
 
 =STATUS=
 
@@ -11,7 +11,8 @@ please consider joining the development!
 
 =INSTALLATION=
 
-Get the source from http://github.com/yaoweibin/squid_gzip
+Get the squid-2.7 source from http://www.squid-cache.org/Versions/v2/2.7/
+Get the patch from http://github.com/yaoweibin/squid_gzip
 
 cd squid-2.7
 patch -p1 < /path/to/http_gzip.patch
@@ -99,7 +100,6 @@ http_gzip_types text/html,text/plain
     probably decreases a number of syscalls (sbrk()/mmap() and so on).
 
 =TODO=
-* add deflate 
 
 =LICENSE=
 
